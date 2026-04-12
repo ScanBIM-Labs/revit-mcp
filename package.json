@@ -1,0 +1,8 @@
+{
+  "name": "revit-mcp",
+  "version": "1.0.0",
+  "description": "Revit MCP — Element queries, clash detection, IFC export via APS",
+  "main": "src/index.js",
+  "author": "ScanBIM Labs LLC",
+  "license": "MIT"
+}
