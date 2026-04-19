@@ -156,14 +156,237 @@ async function ensureBucket(token, bucketKey) {
 // ── Tool Definitions ──────────────────────────────────────────
 
 const TOOLS = [
-  { name: "revit_upload", description: "Upload Revit file to APS and translate to viewable. Provide a publicly accessible file_url.", inputSchema: { type: "object", properties: { file_url: { type: "string", description: "Public URL to download the .rvt file from" }, file_name: { type: "string", description: "Name for the file (e.g. 'MyBuilding.rvt')" }, project_name: { type: "string", description: "Optional project label" } }, required: ["file_url", "file_name"] } },
-  { name: "revit_get_elements", description: "Get all elements from a translated Revit model by category (e.g. Walls, Doors, Windows)", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN of the translated model" }, category: { type: "string", description: "Revit category to filter (e.g. 'Walls', 'Doors', 'Windows', 'Structural Columns')" } }, required: ["model_id", "category"] } },
-  { name: "revit_get_parameters", description: "Get all parameters for elements in a category (or a specific element)", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN" }, category: { type: "string", description: "Revit category to filter" }, element_id: { type: "string", description: "Optional specific element objectid to query" } }, required: ["model_id", "category"] } },
-  { name: "revit_run_schedule", description: "Extract schedule-like tabular data from model properties matching a category or keyword", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN" }, schedule_name: { type: "string", description: "Category or keyword to build schedule from (e.g. 'Walls', 'Doors', 'Rooms')" } }, required: ["model_id", "schedule_name"] } },
-  { name: "revit_clash_detect", description: "Detect spatial clashes between two categories using bounding box overlap analysis + D1 VDC rules", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN" }, category_a: { type: "string", description: "First category (e.g. 'Mechanical Equipment')" }, category_b: { type: "string", description: "Second category (e.g. 'Structural Framing')" } }, required: ["model_id", "category_a", "category_b"] } },
-  { name: "revit_export_ifc", description: "Start IFC export translation job for a model", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN" }, include_properties: { type: "boolean", description: "Include property sets in IFC output" } }, required: ["model_id"] } },
-  { name: "revit_get_sheets", description: "List all sheets in a translated Revit model", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN" } }, required: ["model_id"] } },
-  { name: "revit_get_views", description: "List all views (floor plans, sections, 3D views, etc.) in a translated Revit model", inputSchema: { type: "object", properties: { model_id: { type: "string", description: "Base64-encoded URN" } }, required: ["model_id"] } }
+  {
+    name: "revit_upload",
+    description: [
+      "When to use: Ingest a Revit (.rvt / .rfa / .rte / .rft) file into Autodesk Platform Services by downloading it from a publicly reachable URL, uploading it to an OSS bucket, and starting an SVF2 translation so downstream revit_* tools can read elements, parameters, sheets, and views.",
+      "When NOT to use: Do not call if you already have a translated URN (use the existing model_id instead), if the file is not a Revit source file, or if the URL requires authentication the worker cannot satisfy.",
+      "APS scopes: data:read data:write data:create bucket:read bucket:create viewables:read (OSS bucket create + object PUT + Model Derivative job).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh credentials and retry. 403 scope insufficient — request data:write + bucket:create. 404 bucket/object not found — confirm bucket was created. 409 bucket exists — safe to ignore, reuse it. 429 rate limited — back off with exponential delay. 5xx APS upstream — retry with jitter up to 3x, then surface.",
+      "Side effects: Creates a new transient OSS bucket named scanbim-revit-<timestamp>, uploads the object, and starts a Model Derivative translation job. NOT idempotent — each call creates a fresh bucket and new URN."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        file_url: {
+          type: "string",
+          format: "uri",
+          description: "Public HTTPS URL the worker can fetch the Revit file from. Must return 200 with the raw .rvt bytes (no auth gate, no HTML redirect). Max 100MB for direct upload.",
+          examples: ["https://example.com/models/MyBuilding.rvt"]
+        },
+        file_name: {
+          type: "string",
+          pattern: "^[A-Za-z0-9._-]+\\.(rvt|rfa|rte|rft)$",
+          description: "Original file name including the Revit extension (.rvt, .rfa, .rte, .rft). Used as the OSS object key; non-alphanumeric characters are sanitized to underscores.",
+          examples: ["MyBuilding.rvt"]
+        },
+        project_name: {
+          type: "string",
+          description: "Optional human-readable project label echoed back in the response for bookkeeping. No effect on APS processing.",
+          examples: ["Acme HQ Tower - Phase 2"]
+        }
+      },
+      required: ["file_url", "file_name"]
+    }
+  },
+  {
+    name: "revit_get_elements",
+    description: [
+      "When to use: After a Revit model has finished translating, fetch the first ~100 elements belonging to a Revit category (e.g. Walls, Doors, Windows, Structural Columns) with their objectid, name, externalId, and property bag.",
+      "When NOT to use: Do not call before translation completes (manifest.status must be success), and do not use for free-text searches across the whole model — filter by category here or use revit_run_schedule for tabular views.",
+      "APS scopes: data:read viewables:read (Model Derivative metadata + properties).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add viewables:read. 404 URN not found — confirm model_id and that translation has run. 429 rate limited — back off. 5xx APS upstream — retry with jitter.",
+      "Side effects: Read-only. Idempotent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model (returned from revit_upload as model_id/urn). Always begins with 'dXJu' (base64 of 'urn:').",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        },
+        category: {
+          type: "string",
+          description: "Revit category name to filter on (case-insensitive substring match). Use canonical Revit category names like Walls, Doors, Windows, Structural Columns, Ducts, Pipes, Mechanical Equipment.",
+          examples: ["Walls"]
+        }
+      },
+      required: ["model_id", "category"]
+    }
+  },
+  {
+    name: "revit_get_parameters",
+    description: [
+      "When to use: Enumerate the Revit parameters (type + instance) that appear on elements in a given category, or on one specific element by objectid. Returns unique values per parameter and how many elements carry it — ideal for schema discovery before building a schedule.",
+      "When NOT to use: Do not use when you just need the elements themselves (use revit_get_elements), or to modify values — this is read-only.",
+      "APS scopes: data:read viewables:read (Model Derivative metadata + properties).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add viewables:read. 404 URN not found — verify model_id. 429 rate limited — back off. 5xx APS upstream — retry with jitter.",
+      "Side effects: Read-only. Idempotent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model (returned from revit_upload). Always begins with 'dXJu'.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        },
+        category: {
+          type: "string",
+          description: "Revit category to filter on (case-insensitive substring match). Ignored when element_id is supplied.",
+          examples: ["Doors"]
+        },
+        element_id: {
+          type: "string",
+          description: "Optional APS Model Derivative objectid of a single element to inspect. When provided, overrides category filtering and returns parameters only for that element.",
+          examples: ["12345"]
+        }
+      },
+      required: ["model_id", "category"]
+    }
+  },
+  {
+    name: "revit_run_schedule",
+    description: [
+      "When to use: Build a tabular, spreadsheet-style schedule (rows = elements matching a keyword, columns = up to 15 shared parameters) from a translated Revit model — useful for Door Schedules, Wall Schedules, Room Schedules, and QA/QC exports.",
+      "When NOT to use: Do not use when you only need raw element metadata (use revit_get_elements) or parameter schema (use revit_get_parameters).",
+      "APS scopes: data:read viewables:read (Model Derivative metadata + properties).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add viewables:read. 404 URN not found — check model_id. 429 rate limited — back off. 5xx APS upstream — retry with jitter.",
+      "Side effects: Read-only. Idempotent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model. Always begins with 'dXJu'.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        },
+        schedule_name: {
+          type: "string",
+          description: "Category name or keyword used to select rows (case-insensitive substring match on Category/name). Common examples: Walls, Doors, Windows, Rooms, Furniture, Mechanical Equipment.",
+          examples: ["Doors"]
+        }
+      },
+      required: ["model_id", "schedule_name"]
+    }
+  },
+  {
+    name: "revit_clash_detect",
+    description: [
+      "When to use: Perform a lightweight clash analysis between two Revit categories (e.g. Mechanical Equipment vs Structural Framing) using bounding-box overlap where available, falling back to shared-Level proximity, then annotate with any matching VDC rules stored in the D1 database.",
+      "When NOT to use: Do not use as a substitute for Navisworks Manage for contractual clash reports — this is a first-pass coordination sniff test, not a certified Clash Detective run.",
+      "APS scopes: data:read viewables:read (Model Derivative metadata + properties).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add viewables:read. 404 URN not found — verify model_id. 429 rate limited — back off. 5xx APS upstream — retry with jitter.",
+      "Side effects: Read-only against APS. May read from D1 vdc_rules table if present. Idempotent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model. Always begins with 'dXJu'.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        },
+        category_a: {
+          type: "string",
+          description: "First Revit category for the pairwise clash check (case-insensitive substring match). Typical MEP/structural examples: Mechanical Equipment, Ducts, Pipes, Cable Trays.",
+          examples: ["Mechanical Equipment"]
+        },
+        category_b: {
+          type: "string",
+          description: "Second Revit category to compare against category_a. Often a structural/architectural discipline when category_a is MEP.",
+          examples: ["Structural Framing"]
+        }
+      },
+      required: ["model_id", "category_a", "category_b"]
+    }
+  },
+  {
+    name: "revit_export_ifc",
+    description: [
+      "When to use: Kick off a Model Derivative translation of a previously uploaded Revit URN into IFC (IFC2x3 Coordination View 2.0 by default) so the model can be exchanged with non-Autodesk tools (Solibri, BIMcollab, Tekla, openBIM workflows).",
+      "When NOT to use: Do not use for SVF/SVF2 web viewing (that happens automatically in revit_upload), and do not call repeatedly while a prior IFC job is still inprogress — poll the manifest instead.",
+      "APS scopes: data:read data:write viewables:read (Model Derivative job + manifest).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add data:write. 404 URN not found — confirm model_id was translated. 409 not applicable. 429 rate limited — back off. 5xx APS upstream — retry with jitter up to 3x.",
+      "Side effects: Creates a Model Derivative job and, on completion, a new IFC derivative inside the model's manifest. Safe to re-run (APS deduplicates) but each call with x-ads-force may retranslate."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model to export to IFC. Always begins with 'dXJu'.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        },
+        include_properties: {
+          type: "boolean",
+          default: true,
+          description: "Whether to include Revit property sets in the IFC output. true -> IFC2x3 Coordination View 2.0 (with psets); false -> minimal IFC2x3 geometry.",
+          examples: [true]
+        }
+      },
+      required: ["model_id"]
+    }
+  },
+  {
+    name: "revit_get_sheets",
+    description: [
+      "When to use: Enumerate the drawing sheets (title blocks with sheet number + sheet name like 'A-101: First Floor Plan') published from a translated Revit model, so an agent can pick which sheet to render, review, or cross-reference.",
+      "When NOT to use: Do not use to list model views like floor plans or 3D views (use revit_get_views) — this returns only 2D sheet entries.",
+      "APS scopes: data:read viewables:read (Model Derivative metadata + object tree).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add viewables:read. 404 URN not found — check model_id. 429 rate limited — back off. 5xx APS upstream — retry with jitter.",
+      "Side effects: Read-only. Idempotent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model whose sheets you want to list. Always begins with 'dXJu'.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        }
+      },
+      required: ["model_id"]
+    }
+  },
+  {
+    name: "revit_get_views",
+    description: [
+      "When to use: Return every view (both 2D — floor plans, ceiling plans, elevations, sections, sheets — and 3D — default {3D}, perspective views, isometric views) in the translated Revit model, including each view's GUID, name, role, and whether it is the master view.",
+      "When NOT to use: Do not use when you only want drawing sheets (use revit_get_sheets) or element data inside a view (use revit_get_elements / revit_run_schedule).",
+      "APS scopes: data:read viewables:read (Model Derivative metadata + object tree).",
+      "Rate limits: APS default ~50 req/min per app per endpoint; Model Derivative translation jobs ~60 req/min; OSS uploads size-limited per file to 100MB for direct upload, larger via resumable.",
+      "Errors: 401 APS token expired — refresh. 403 scope insufficient — add viewables:read. 404 URN not found — check model_id. 429 rate limited — back off. 5xx APS upstream — retry with jitter.",
+      "Side effects: Read-only. Idempotent."
+    ].join("\n"),
+    inputSchema: {
+      type: "object",
+      properties: {
+        model_id: {
+          type: "string",
+          pattern: "^dXJu[A-Za-z0-9_-]+$",
+          description: "Base64url-encoded URN of the translated Revit model whose views you want to list. Always begins with 'dXJu'.",
+          examples: ["dXJuOmFkc2sub2JqZWN0czpvcy5vYmplY3Q6c2NhbmJpbS1yZXZpdC0xNzMxMjM0NTY3L015QnVpbGRpbmcucnZ0"]
+        }
+      },
+      required: ["model_id"]
+    }
+  }
 ];
 
 // ── Real Tool Handlers ────────────────────────────────────────
